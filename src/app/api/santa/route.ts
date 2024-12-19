@@ -1,21 +1,8 @@
+// app/api/santa/route.ts
 import { NextResponse } from 'next/server';
-import fs from 'fs/promises';
-import path from 'path';
 import connectToMongoDB from '@/lib/mongodb';
 import SecretSanta from '@/models/SecretSanta';
-
-const NAMES_FILE_PATH = path.join(process.cwd(), 'data', 'names.json');
-
-interface Person {
-  name: string;
-  email: string;
-  drive_link: string;
-  description: string;
-}
-
-interface NameData {
-  unassigned: Person[];
-}
+import UnassignedNames from '@/models/UnassignedNames'; 
 
 export async function POST(request: Request) {
   try {
@@ -72,29 +59,10 @@ export async function POST(request: Request) {
         );
       }
 
-      // Read and parse names file
-      let namesData: NameData;
-      try {
-        const fileContent = await fs.readFile(NAMES_FILE_PATH, 'utf-8');
-        namesData = JSON.parse(fileContent);
-        
-        if (!namesData.unassigned) {
-          throw new Error('Invalid file structure');
-        }
-        
-        console.log('Available names before assignment:', namesData.unassigned.length);
-      } catch (error) {
-        console.error('Error reading names file:', error);
-        return NextResponse.json(
-          { error: 'Failed to read available names' },
-          { status: 500 }
-        );
-      }
-
-      // Get available names excluding user's own name
-      const availableNames = namesData.unassigned.filter(person => 
-        person.name.toLowerCase() !== name.toLowerCase()
-      );
+      // Get available names from MongoDB
+      const availableNames = await UnassignedNames.find({
+        name: { $ne: name.toLowerCase() }
+      });
 
       if (availableNames.length === 0) {
         return NextResponse.json(
@@ -107,41 +75,32 @@ export async function POST(request: Request) {
       const randomIndex = Math.floor(Math.random() * availableNames.length);
       const selectedPerson = availableNames[randomIndex];
 
-      // Create new assignment
-      const newAssignment = new SecretSanta({
-        user: {
-          name,
-          email: email.toLowerCase(),
-          password
-        },
-        assignedPerson: {
-          name: selectedPerson.name,
-          email: selectedPerson.email,
-          drive_link: selectedPerson.drive_link,
-          description: selectedPerson.description
-        }
-      });
-
+      // Start a MongoDB session for transaction
+      const session = await SecretSanta.startSession();
+      
       try {
-        // Save to MongoDB
-        await newAssignment.save();
-        console.log('Assignment saved to MongoDB');
+        await session.withTransaction(async () => {
+          // Create new assignment
+          const newAssignment = new SecretSanta({
+            user: {
+              name,
+              email: email.toLowerCase(),
+              password
+            },
+            assignedPerson: {
+              name: selectedPerson.name,
+              email: selectedPerson.email,
+              drive_link: selectedPerson.drive_link,
+              description: selectedPerson.description
+            }
+          });
 
-        // Update the available names
-        namesData.unassigned = namesData.unassigned.filter(person => 
-          person.name.toLowerCase() !== selectedPerson.name.toLowerCase()
-        );
-        
-        console.log('Available names after filtering:', namesData.unassigned.length);
-        
-        // Write updated names back to file
-        await fs.writeFile(
-          NAMES_FILE_PATH, 
-          JSON.stringify(namesData, null, 2),
-          'utf-8'
-        );
-        
-        console.log('Names file updated successfully');
+          // Save assignment
+          await newAssignment.save({ session });
+
+          // Remove the assigned person from available names
+          await UnassignedNames.findByIdAndDelete(selectedPerson._id, { session });
+        });
 
         return NextResponse.json({
           name: selectedPerson.name,
@@ -149,22 +108,13 @@ export async function POST(request: Request) {
           driveLink: selectedPerson.drive_link
         });
       } catch (error) {
-        console.error('Error saving assignment:', error);
-        
-        // If MongoDB save succeeds but file update fails, cleanup the MongoDB entry
-        if (newAssignment._id) {
-          try {
-            await SecretSanta.findByIdAndDelete(newAssignment._id);
-            console.log('Cleaned up MongoDB entry after file update failure');
-          } catch (cleanupError) {
-            console.error('Failed to cleanup MongoDB entry:', cleanupError);
-          }
-        }
-
+        console.error('Transaction failed:', error);
         return NextResponse.json(
           { error: 'Failed to save assignment' },
           { status: 500 }
         );
+      } finally {
+        await session.endSession();
       }
     }
 
