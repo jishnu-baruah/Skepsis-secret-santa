@@ -59,14 +59,50 @@ export async function POST(request: Request) {
         );
       }
 
-      // Get available names from MongoDB
+      // Check if the registering person exists in UnassignedNames with matching name AND email
+      const registeringPerson = await UnassignedNames.findOne({
+        $and: [
+          { name: { $regex: new RegExp(`^${name.trim()}$`, 'i') } }, // Case-insensitive exact name match
+          { email: email.toLowerCase() } // Exact email match (case-insensitive)
+        ]
+      });
+
+      if (!registeringPerson) {
+        // Check if either name or email exists separately to give more specific error message
+        const nameExists = await UnassignedNames.findOne({
+          name: { $regex: new RegExp(`^${name.trim()}$`, 'i') }
+        });
+        const emailExists = await UnassignedNames.findOne({
+          email: email.toLowerCase()
+        });
+
+        if (nameExists) {
+          return NextResponse.json(
+            { error: 'This name is registered with a different email address' },
+            { status: 403 }
+          );
+        } else if (emailExists) {
+          return NextResponse.json(
+            { error: 'This email is registered with a different name' },
+            { status: 403 }
+          );
+        } else {
+          return NextResponse.json(
+            { error: 'Your name and email combination was not found in the Secret Santa list. Please check your details or contact the organizer.' },
+            { status: 403 }
+          );
+        }
+      }
+
+      // Get available names from MongoDB but exclude their own name and anyone already assigned
       const availableNames = await UnassignedNames.find({
-        name: { $ne: name.toLowerCase() }
+        _id: { $ne: registeringPerson._id },
+        name: { $nin: await getAssignedNames() }
       });
 
       if (availableNames.length === 0) {
         return NextResponse.json(
-          { error: 'No suitable names available' },
+          { error: 'No suitable names available for assignment' },
           { status: 404 }
         );
       }
@@ -83,9 +119,11 @@ export async function POST(request: Request) {
           // Create new assignment
           const newAssignment = new SecretSanta({
             user: {
-              name,
-              email: email.toLowerCase(),
-              password
+              name: registeringPerson.name, // Use the exact name from the database
+              email: registeringPerson.email.toLowerCase(),
+              password,
+              drive_link: registeringPerson.drive_link,
+              description: registeringPerson.description
             },
             assignedPerson: {
               name: selectedPerson.name,
@@ -97,9 +135,6 @@ export async function POST(request: Request) {
 
           // Save assignment
           await newAssignment.save({ session });
-
-          // Remove the assigned person from available names
-          await UnassignedNames.findByIdAndDelete(selectedPerson._id, { session });
         });
 
         return NextResponse.json({
@@ -131,4 +166,10 @@ export async function POST(request: Request) {
       { status: 500 }
     );
   }
+}
+
+// Helper function to get list of names that have already been assigned to someone
+async function getAssignedNames(): Promise<string[]> {
+  const assignments = await SecretSanta.find({}, 'assignedPerson.name');
+  return assignments.map(assignment => assignment.assignedPerson.name);
 }
